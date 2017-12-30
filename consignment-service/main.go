@@ -1,72 +1,83 @@
-// consignment-service/main.go
 package main
 
 import (
+	"fmt"
 	"log"
-	"net"
 
-	// Import the generated protobuf code
+	micro "github.com/micro/go-micro"
 	pb "github.com/redorb/shippy/consignment-service/proto/consignment"
+	vesselProto "github.com/redorb/shippy/vessel-service/proto/vessel"
 	"golang.org/x/net/context"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
 )
 
-const (
-	port = ":50051"
-)
-
-type IRepository interface {
+type Repository interface {
 	Create(*pb.Consignment) (*pb.Consignment, error)
 	GetAll() []*pb.Consignment
 }
 
-type Repository struct {
+type ConsignmentRepository struct {
 	consignments []*pb.Consignment
 }
 
-func (repo *Repository) Create(consignment *pb.Consignment) (*pb.Consignment, error) {
+func (repo *ConsignmentRepository) Create(consignment *pb.Consignment) (*pb.Consignment, error) {
 	updated := append(repo.consignments, consignment)
 	repo.consignments = updated
 	return consignment, nil
 }
 
-func (repo *Repository) GetAll() []*pb.Consignment {
+func (repo *ConsignmentRepository) GetAll() []*pb.Consignment {
 	return repo.consignments
 }
 
 type service struct {
-	repo IRepository
+	repo         Repository
+	vesselClient vesselProto.VesselServiceClient
 }
 
-func (s *service) CreateConsignment(ctx context.Context, req *pb.Consignment) (*pb.Response, error) {
-	consignment, err := s.repo.Create(req)
+func (s *service) CreateConsignment(ctx context.Context, req *pb.Consignment, res *pb.Response) error {
+	vesselResponse, err := s.vesselClient.FindAvailable(context.Background(), &vesselProto.Specification{
+		MaxWeight: req.Weight,
+		Capacity:  int32(len(req.Containers)),
+	})
+	log.Printf("Found vessel: %s \n", vesselResponse.Vessel.Name)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return &pb.Response{Created: true, Consignment: consignment}, nil
+	req.VesselId = vesselResponse.Vessel.Id
+
+	consignment, err := s.repo.Create(req)
+	if err != nil {
+		return err
+	}
+
+	res.Created = true
+	res.Consignment = consignment
+	return nil
 }
 
-func (s *service) GetConsignments(ctx context.Context, req *pb.GetRequest) (*pb.Response, error) {
+func (s *service) GetConsignments(ctx context.Context, req *pb.GetRequest, res *pb.Response) error {
 	consignments := s.repo.GetAll()
-	return &pb.Response{Consignments: consignments}, nil
+	res.Consignments = consignments
+	return nil
 }
 
 func main() {
 
-	repo := &Repository{}
+	repo := &ConsignmentRepository{}
 
-	lis, err := net.Listen("tcp", port)
-	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
-	}
-	s := grpc.NewServer()
+	srv := micro.NewService(
+		micro.Name("go.micro.srv.consignment"),
+		micro.Version("latest"),
+	)
 
-	pb.RegisterShippingServiceServer(s, &service{repo})
+	vesselClient := vesselProto.NewVesselServiceClient("go.micro.srv.vessel", srv.Client())
 
-	reflection.Register(s)
-	if err := s.Serve(lis); err != nil {
-		log.Fatalf("failed to serve: %v", err)
+	srv.Init()
+
+	pb.RegisterShippingServiceHandler(srv.Server(), &service{repo, vesselClient})
+
+	if err := srv.Run(); err != nil {
+		fmt.Println(err)
 	}
 }
